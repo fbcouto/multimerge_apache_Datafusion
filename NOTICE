@@ -1,0 +1,14 @@
+multimerge-datafusion
+Copyright 2026 the authors of multimerge-datafusion and adaptive-parallel-multimerge-sort
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/):
+
+- benches/sort.rs is benches/sort.rs of Apache DataFusion 55.3.0, with cases added for the
+  MultiMerge operator over the same data;
+- the queries of examples/sort_tpch.rs are those of benchmarks/src/sort_tpch.rs of Apache
+  DataFusion 55.3.0.
+
+src/engine.rs is a copy of src/multimerge.rs of adaptive-parallel-multimerge-sort
+(https://github.com/fbcouto/adaptive-parallel-multimerge-sort), licensed under the Apache
+License, Version 2.0.

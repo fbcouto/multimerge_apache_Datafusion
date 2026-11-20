@@ -1,0 +1,49 @@
+[package]
+name = "multimerge-datafusion"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Sort operator for Apache DataFusion backed by the Adaptive Parallel MultiMerge Sort engine."
+repository = "https://github.com/fbcouto/multimerge_apache_Datafusion"
+readme = "README.md"
+keywords = ["datafusion", "sort", "arrow", "radix", "parallel"]
+categories = ["database-implementations", "algorithms"]
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "benches/**/*.rs",
+    "examples/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+]
+# Publishing is the author's decision; remove this line to publish.
+publish = false
+
+[dependencies]
+datafusion = "55"
+futures = "0.3"
+rayon = "1.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = false
+
+[dev-dependencies]
+# The same crates and versions that benches/sort.rs uses inside DataFusion.
+arrow = "59.3"
+criterion = "0.8"
+datafusion-datasource = "55.3"
+datafusion-execution = "55.3"
+datafusion-physical-expr = "55.3"
+datafusion-physical-expr-common = "55.3"
+itertools = "0.15"
+rand = "0.9"
+
+[[bench]]
+name = "sort"
+harness = false

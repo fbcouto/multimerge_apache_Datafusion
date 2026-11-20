@@ -1,0 +1,4 @@
+# The formatting of Apache DataFusion (its rustfmt.toml), so that benches/sort.rs, which is
+# DataFusion's own benchmark with cases added, keeps the formatting it has there.
+style_edition = "2024"
+max_width = 90
