@@ -11,7 +11,8 @@
 //!
 //! ```text
 //! cargo run --release --example sort_tpch -- --path DIR [--query N] [--iterations N]
-//!     [--partitions N] [--batch-size N] [--mem-table] [--explain] [--output FILE.json]
+//!     [--partitions N] [--batch-size N] [--mem-table] [--modes LIST] [--explain]
+//!     [--output FILE.json]
 //! ```
 //!
 //! The data can be generated with `tpchgen-cli` (`pip install tpchgen-cli`):
@@ -19,6 +20,9 @@
 //!
 //! `DIR/lineitem` holds the Parquet files. With `--mem-table` the table is loaded into memory first,
 //! split into `--partitions` partitions, so that the time is the time of the sort and not of the scan.
+//! `--modes` runs only some of the three plans, as a comma-separated list of `datafusion`, `final`
+//! and `whole` (for example to measure the memory of each one in its own process). DataFusion's own
+//! options can be set through their `DATAFUSION_*` environment variables.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -105,8 +109,32 @@ struct Options {
     partitions: usize,
     batch_size: usize,
     mem_table: bool,
+    /// Which plans run: 0 = DataFusion's, 1 = final merge, 2 = whole sort.
+    modes: Vec<usize>,
     explain: bool,
     output: Option<String>,
+}
+
+/// The `--modes` list: a comma-separated subset of `datafusion`, `final` and `whole`.
+fn parse_modes(text: &str) -> std::result::Result<Vec<usize>, String> {
+    let mut modes = Vec::new();
+    for mode in text.split(',') {
+        let index = match mode.trim() {
+            "datafusion" => 0,
+            "final" => 1,
+            "whole" => 2,
+            other => {
+                return Err(format!(
+                    "--modes: unknown mode {other} (datafusion, final, whole)"
+                ));
+            }
+        };
+        if !modes.contains(&index) {
+            modes.push(index);
+        }
+    }
+    modes.sort_unstable();
+    Ok(modes)
 }
 
 fn options() -> std::result::Result<Options, String> {
@@ -120,6 +148,7 @@ fn options() -> std::result::Result<Options, String> {
         partitions: cores,
         batch_size: 8192,
         mem_table: false,
+        modes: vec![0, 1, 2],
         explain: false,
         output: None,
     };
@@ -146,6 +175,7 @@ fn options() -> std::result::Result<Options, String> {
             }
             "--output" | "-o" => options.output = Some(value("--output")?),
             "--mem-table" | "-m" => options.mem_table = true,
+            "--modes" => options.modes = parse_modes(&value("--modes")?)?,
             "--explain" => options.explain = true,
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -186,12 +216,12 @@ fn median(values: &[f64]) -> f64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = options().map_err(DataFusionError::Execution)?;
-    let config = || {
-        SessionConfig::new()
-            .with_target_partitions(options.partitions)
-            .with_batch_size(options.batch_size)
-    };
-    let contexts = [
+    // Any DataFusion option can also be set through its DATAFUSION_* environment variable.
+    let base = SessionConfig::from_env()?
+        .with_target_partitions(options.partitions)
+        .with_batch_size(options.batch_size);
+    let config = || base.clone();
+    let contexts: Vec<(&str, SessionContext)> = [
         ("datafusion", SessionContext::new_with_config(config())),
         (
             "multimerge final merge",
@@ -201,7 +231,12 @@ async fn main() -> Result<()> {
             "multimerge whole sort",
             SessionContext::new_with_state(session_state(config(), Mode::WholeSort)),
         ),
-    ];
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(index, _)| options.modes.contains(index))
+    .map(|(_, context)| context)
+    .collect();
 
     let lineitem = format!("{}/lineitem", options.path.trim_end_matches('/'));
     for (_, ctx) in &contexts {
@@ -271,14 +306,25 @@ async fn main() -> Result<()> {
         }
 
         let medians: Vec<f64> = times.iter().map(|t| median(t)).collect();
-        println!(
-            "   median: datafusion {:.1} ms | final merge {:.1} ms ({:.2}x) | whole sort {:.1} ms ({:.2}x)",
-            medians[0],
-            medians[1],
-            medians[0] / medians[1],
-            medians[2],
-            medians[0] / medians[2]
-        );
+        let reference = contexts
+            .iter()
+            .position(|(name, _)| *name == "datafusion")
+            .map(|index| medians[index]);
+        let summary = contexts
+            .iter()
+            .zip(&medians)
+            .map(|((name, _), ms)| {
+                let name = name.trim_start_matches("multimerge ");
+                match reference {
+                    Some(reference) if name != "datafusion" => {
+                        format!("{name} {ms:.1} ms ({:.2}x)", reference / ms)
+                    }
+                    _ => format!("{name} {ms:.1} ms"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("   median: {summary}");
 
         let _ = write!(
             json,
