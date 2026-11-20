@@ -24,14 +24,18 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use datafusion::arrow::array::builder::GenericByteViewBuilder;
 use datafusion::arrow::array::{
-    Array, ArrayData, ArrayRef, RecordBatchOptions, UInt32Array, UInt64Array, make_array,
+    Array, ArrayData, ArrayRef, AsArray, GenericByteViewArray, RecordBatchOptions,
+    UInt32Array, UInt64Array, make_array,
 };
 use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::compute::{
     concat, interleave_record_batch, take, take_record_batch,
 };
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{
+    BinaryViewType, ByteViewType, DataType, SchemaRef, StringViewType,
+};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
@@ -101,7 +105,8 @@ impl SortStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gather {
     /// Every column is first put in one array and the rows are then taken from it by position.
-    /// Dictionaries are merged once, and a taken dictionary or string view is only its keys or views.
+    /// Dictionaries are merged once, and a taken dictionary is only its keys. String view columns
+    /// are the exception: their strings are copied into each output batch (see `copy_views`).
     Take,
     /// Rows are picked straight from the input batches, one output batch at a time.
     Interleave,
@@ -654,8 +659,17 @@ fn sort_in_pool(
     Ok((output, stats))
 }
 
+/// One column of the input, as [`gather_by_take`] reads it.
+enum Source {
+    /// All the rows in one array, taken by position.
+    Whole(ArrayRef),
+    /// A string view column, batch by batch: its rows are copied (see [`copy_views`]).
+    Views(Vec<ArrayRef>),
+}
+
 /// Builds the output by position: every column of the input becomes one array, and each output
-/// batch takes its rows from those arrays.
+/// batch takes its rows from those arrays. String view columns stay batch by batch and their rows
+/// are copied instead (see [`copy_views`]).
 fn gather_by_take(
     batches: Vec<RecordBatch>,
     schema: &SchemaRef,
@@ -669,20 +683,24 @@ fn gather_by_take(
         total += batch.num_rows() as u64;
     }
 
-    let columns: Vec<ArrayRef> = if batches.len() == 1 {
-        batches[0].columns().to_vec()
-    } else {
-        (0..schema.fields().len())
-            .into_par_iter()
-            .map(|column| {
-                let parts: Vec<&dyn Array> = batches
-                    .iter()
-                    .map(|batch| batch.column(column).as_ref())
-                    .collect();
-                concat(&parts)
-            })
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()?
-    };
+    let columns: Vec<Source> = (0..schema.fields().len())
+        .into_par_iter()
+        .map(|column| {
+            let parts: Vec<&ArrayRef> =
+                batches.iter().map(|batch| batch.column(column)).collect();
+            if matches!(
+                schema.field(column).data_type(),
+                DataType::Utf8View | DataType::BinaryView
+            ) {
+                Ok(Source::Views(parts.into_iter().cloned().collect()))
+            } else if parts.len() == 1 {
+                Ok(Source::Whole(Arc::clone(parts[0])))
+            } else {
+                let parts: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
+                Ok(Source::Whole(concat(&parts)?))
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
     // The input is not needed any more: its rows are in `columns`.
     drop(batches);
 
@@ -693,21 +711,20 @@ fn gather_by_take(
     elements
         .par_chunks(batch_size)
         .map(|chunk| {
-            let taken = if narrow {
-                let indices = UInt32Array::from_iter_values(
+            let indices: ArrayRef = if narrow {
+                Arc::new(UInt32Array::from_iter_values(
                     chunk.iter().map(|e| position(e) as u32),
-                );
-                columns
-                    .iter()
-                    .map(|column| take(column.as_ref(), &indices, None))
-                    .collect::<std::result::Result<Vec<_>, _>>()
+                ))
             } else {
-                let indices = UInt64Array::from_iter_values(chunk.iter().map(position));
-                columns
-                    .iter()
-                    .map(|column| take(column.as_ref(), &indices, None))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-            }?;
+                Arc::new(UInt64Array::from_iter_values(chunk.iter().map(position)))
+            };
+            let taken = columns
+                .iter()
+                .map(|column| match column {
+                    Source::Whole(array) => take(array.as_ref(), indices.as_ref(), None),
+                    Source::Views(arrays) => Ok(copy_views(arrays, chunk)),
+                })
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
             let options = RecordBatchOptions::new().with_row_count(Some(chunk.len()));
             Ok(RecordBatch::try_new_with_options(
                 Arc::clone(schema),
@@ -716,6 +733,63 @@ fn gather_by_take(
             )?)
         })
         .collect()
+}
+
+/// The rows of `chunk` from a string view column given batch by batch (`arrays`), with the strings
+/// that do not fit in their view copied into one data buffer of the output.
+///
+/// Taking the views would copy less, but a taken view array keeps the list of every data buffer of
+/// the array it is taken from. A column put together from thousands of batches lists thousands of
+/// buffers (and many more when the batches are merges, as in the final merge), and each output
+/// batch got its own copy of that list: memory grew with the square of the rows. At TPC-H scale
+/// factor 10 the final merge of `ORDER BY l_comment` ran out of memory on a 47 GB machine.
+fn copy_views(arrays: &[ArrayRef], chunk: &[Element]) -> ArrayRef {
+    match arrays[0].data_type() {
+        DataType::Utf8View => Arc::new(copy_views_of::<StringViewType>(arrays, chunk)),
+        _ => Arc::new(copy_views_of::<BinaryViewType>(arrays, chunk)),
+    }
+}
+
+fn copy_views_of<T: ByteViewType>(
+    arrays: &[ArrayRef],
+    chunk: &[Element],
+) -> GenericByteViewArray<T> {
+    let arrays: Vec<&GenericByteViewArray<T>> = arrays
+        .iter()
+        .map(|array| array.as_byte_view::<T>())
+        .collect();
+    let row = |element: &Element| {
+        (
+            arrays[(element.id >> ROW_BITS) as usize],
+            (element.id & ROW_MASK) as usize,
+        )
+    };
+    // The bytes of the strings that a view does not hold (more than 12), for one buffer of that size.
+    let long: usize = chunk
+        .iter()
+        .map(|element| {
+            let (array, i) = row(element);
+            let len = array.views()[i] as u32 as usize;
+            if len > 12 && array.is_valid(i) {
+                len
+            } else {
+                0
+            }
+        })
+        .sum();
+    let mut builder = GenericByteViewBuilder::<T>::with_capacity(chunk.len());
+    if let Ok(size @ 1..) = u32::try_from(long) {
+        builder = builder.with_fixed_block_size(size);
+    }
+    for element in chunk {
+        let (array, i) = row(element);
+        if array.is_valid(i) {
+            builder.append_value(array.value(i));
+        } else {
+            builder.append_null();
+        }
+    }
+    builder.finish()
 }
 
 /// How many bytes `a` and `b` have in common at the beginning.

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
+    ArrayRef, AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
+    Float32Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
     TimestampNanosecondArray, UInt16Array,
 };
 use datafusion::arrow::compute::{SortOptions, concat_batches};
@@ -112,7 +112,13 @@ fn table(
                 r % 300_000,
                 tail
             ));
-            views.push(format!("view-{:020}", r % 70_000));
+            // Mostly strings longer than a view holds (12 bytes), some short ones and some nulls.
+            views.push(match id % 23 {
+                0 => None,
+                1 => Some(String::new()),
+                2 => Some(format!("v{}", r % 1000)),
+                _ => Some(format!("view-{:020}", r % 70_000)),
+            });
             dict.push(format!("group-{:02}", r % 50));
             decimals.push((r as i128 % 2_000_000_000_001) - 1_000_000_000_000);
             stamps.push((r % 4_000_000_000_000_000_000) as i64);
@@ -136,7 +142,9 @@ fn table(
             ("url", Arc::new(StringArray::from(urls))),
             (
                 "view",
-                Arc::new(StringViewArray::from_iter_values(views.iter())),
+                Arc::new(StringViewArray::from_iter(
+                    views.iter().map(|v| v.as_deref()),
+                )),
             ),
             ("dict", Arc::new(dictionary)),
             ("dec", Arc::new(decimals)),
@@ -506,6 +514,42 @@ fn takes_the_path_of_the_input() -> Result<()> {
         true,
     )?;
     assert_eq!(stats.path, SortPath::SingleRun);
+    Ok(())
+}
+
+/// A string view column is copied into each output batch, which then lists one data buffer at most.
+/// A taken view array keeps the list of every data buffer of the column it comes from (here one per
+/// input batch), and before the copy every output batch carried that whole list: at TPC-H scale
+/// factor 10 the merge of sorted partitions ran out of memory with it.
+#[test]
+fn output_string_views_hold_only_their_own_strings() -> Result<()> {
+    let (schema, data) = table(50_000, 8, 512);
+    let index = schema.index_of("view").unwrap();
+    let buffers =
+        |batch: &RecordBatch| batch.column(index).as_string_view().data_buffers().len();
+    assert!(data.iter().flatten().map(&buffers).sum::<usize>() >= 100);
+    for keys in [&[("i64", false, false)][..], &[("view", true, false)][..]] {
+        let sort = ordering(&schema, keys);
+        let (whole, stats) = sort_batches(data.clone(), &sort, 1000, 4, false)?;
+        assert_eq!(stats.path, SortPath::Engine, "{keys:?}");
+        // The partitions sorted one by one, then merged.
+        let sorted = data
+            .iter()
+            .map(|part| {
+                sort_batches(vec![part.clone()], &sort, 700, 4, false)
+                    .map(|(batches, _)| batches)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (merged, stats) = sort_batches(sorted, &sort, 1000, 4, true)?;
+        assert_eq!(stats.path, SortPath::Engine, "{keys:?}, merge");
+        for batch in whole.iter().chain(&merged) {
+            assert!(
+                buffers(batch) <= 1,
+                "{keys:?}: an output batch lists {} buffers",
+                buffers(batch)
+            );
+        }
+    }
     Ok(())
 }
 
