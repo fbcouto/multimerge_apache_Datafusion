@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! cargo run --release --example sort_tpch -- --path DIR [--query N] [--iterations N]
-//!     [--partitions N] [--batch-size N] [--mem-table] [--modes LIST] [--explain]
+//!     [--partitions N] [--batch-size N] [--mem-table] [--modes LIST] [--explain] [--analyze]
 //!     [--output FILE.json]
 //! ```
 //!
@@ -21,13 +21,16 @@
 //! `DIR/lineitem` holds the Parquet files. With `--mem-table` the table is loaded into memory first,
 //! split into `--partitions` partitions, so that the time is the time of the sort and not of the scan.
 //! `--modes` runs only some of the three plans, as a comma-separated list of `datafusion`, `final`
-//! and `whole` (for example to measure the memory of each one in its own process). DataFusion's own
-//! options can be set through their `DATAFUSION_*` environment variables.
+//! and `whole` (for example to measure the memory of each one in its own process). `--analyze` runs
+//! each query once per plan with `EXPLAIN ANALYZE` and prints the plan with its metrics (for the
+//! operator: time preparing the keys, in the engine and building the output) instead of timing it.
+//! DataFusion's own options can be set through their `DATAFUSION_*` environment variables.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{displayable, execute_stream};
@@ -112,6 +115,7 @@ struct Options {
     /// Which plans run: 0 = DataFusion's, 1 = final merge, 2 = whole sort.
     modes: Vec<usize>,
     explain: bool,
+    analyze: bool,
     output: Option<String>,
 }
 
@@ -150,6 +154,7 @@ fn options() -> std::result::Result<Options, String> {
         mem_table: false,
         modes: vec![0, 1, 2],
         explain: false,
+        analyze: false,
         output: None,
     };
     let mut args = std::env::args().skip(1);
@@ -177,6 +182,7 @@ fn options() -> std::result::Result<Options, String> {
             "--mem-table" | "-m" => options.mem_table = true,
             "--modes" => options.modes = parse_modes(&value("--modes")?)?,
             "--explain" => options.explain = true,
+            "--analyze" => options.analyze = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -285,6 +291,17 @@ async fn main() -> Result<()> {
             if options.explain {
                 println!("--- plan with {name}\n{text}");
             }
+        }
+        if options.analyze {
+            for (name, ctx) in &contexts {
+                let batches = ctx
+                    .sql(&format!("EXPLAIN ANALYZE {sql}"))
+                    .await?
+                    .collect()
+                    .await?;
+                println!("--- {name}\n{}", pretty_format_batches(&batches)?);
+            }
+            continue;
         }
 
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); contexts.len()];
