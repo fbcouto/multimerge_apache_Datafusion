@@ -598,3 +598,48 @@ async fn the_rule_replaces_only_full_sorts() -> Result<()> {
     }
     Ok(())
 }
+
+/// Window functions over different orderings of the same column, with NULLS FIRST and LAST:
+/// each sort in the plan re-sorts the output of the one below it. A whole sort has to replace
+/// the orderings of its input with its own, as `SortExec` does. Keeping them, DataFusion's final
+/// check of the plan (`SanityCheckPlan`) rejected it; found with DataFusion's `window.slt`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_functions_over_conflicting_orderings() -> Result<()> {
+    let config = || {
+        SessionConfig::new()
+            .with_target_partitions(4)
+            .with_batch_size(64)
+    };
+    let default = SessionContext::new_with_config(config());
+    let whole = SessionContext::new_with_state(session_state(config(), Mode::WholeSort));
+    let merge = SessionContext::new_with_state(session_state(config(), Mode::FinalMerge));
+    let create = "CREATE TABLE w AS SELECT CAST(value AS INT) AS c1, \
+        CASE WHEN value % 7 = 0 THEN NULL ELSE CAST(value % 23 AS INT) END AS c3 \
+        FROM generate_series(1, 400)";
+    for ctx in [&default, &whole, &merge] {
+        ctx.sql(create).await?.collect().await?;
+    }
+    let sql = "SELECT c1, c3, \
+        SUM(c1) OVER (ORDER BY c3 RANGE BETWEEN 10 PRECEDING AND 11 FOLLOWING) AS a, \
+        SUM(c1) OVER (ORDER BY c3 DESC RANGE BETWEEN 10 PRECEDING AND 11 FOLLOWING) AS b, \
+        SUM(c1) OVER (ORDER BY c3 DESC NULLS LAST \
+            RANGE BETWEEN 10 PRECEDING AND 11 FOLLOWING) AS c, \
+        SUM(c1) OVER (ORDER BY c3 NULLS FIRST \
+            RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS d, \
+        SUM(c1) OVER (ORDER BY c3 DESC, c1) AS e, \
+        SUM(c1) OVER (ORDER BY c3, c1 DESC) AS f \
+        FROM w ORDER BY c1";
+    let expected = default.sql(sql).await?.collect().await?;
+    let expected = concat_batches(&expected[0].schema(), &expected)?;
+    let text = plan_text(&whole, sql).await?;
+    assert!(
+        text.matches("MultimergeSortExec").count() >= 3,
+        "whole sort plan:\n{text}"
+    );
+    for (name, ctx) in [("whole sort", &whole), ("final merge", &merge)] {
+        let actual = ctx.sql(sql).await?.collect().await?;
+        let actual = concat_batches(&actual[0].schema(), &actual)?;
+        assert_eq!(expected, actual, "{name}");
+    }
+    Ok(())
+}

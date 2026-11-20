@@ -11,7 +11,7 @@ use datafusion::common::utils::memory::get_record_batch_memory_size;
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryConsumer;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 use datafusion::physical_plan::common::spawn_buffered;
 use datafusion::physical_plan::execution_plan::{
@@ -55,7 +55,7 @@ impl MultimergeSortExec {
         input: Arc<dyn ExecutionPlan>,
         sorted_input: bool,
     ) -> Self {
-        let cache = Self::compute_properties(&input, expr.clone());
+        let cache = Self::compute_properties(&input, expr.clone(), sorted_input);
         Self {
             input,
             expr,
@@ -81,10 +81,21 @@ impl MultimergeSortExec {
     fn compute_properties(
         input: &Arc<dyn ExecutionPlan>,
         ordering: LexOrdering,
+        sorted_input: bool,
     ) -> PlanProperties {
         let mut eq_properties = input.equivalence_properties().clone();
+        // One output partition: what was constant only within a partition is not any more.
         eq_properties.clear_per_partition_constants();
-        eq_properties.add_ordering(ordering);
+        if sorted_input {
+            // A merge, as `SortPreservingMergeExec`: the partitions are already in this ordering.
+            eq_properties.add_ordering(ordering);
+        } else if eq_properties.reorder(ordering.clone()).is_err() {
+            // A whole sort, as `SortExec`: its ordering replaces the orderings of the input, which
+            // a sort does not keep (`reorder` keeps them only when they agree with it). It fails
+            // only on an internal error; then nothing of the input's ordering is kept.
+            eq_properties = EquivalenceProperties::new(input.schema());
+            eq_properties.add_ordering(ordering);
+        }
         PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
