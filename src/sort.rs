@@ -105,8 +105,9 @@ impl SortStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gather {
     /// Every column is first put in one array and the rows are then taken from it by position.
-    /// Dictionaries are merged once, and a taken dictionary is only its keys. String view columns
-    /// are the exception: their strings are copied into each output batch (see `copy_views`).
+    /// Dictionaries are merged once, and a taken dictionary or string view is only its keys or
+    /// views. A string view column whose buffer lists would grow too long (after a merge, or with
+    /// many small batches) is copied into each output batch instead (see `gather_by_take`).
     Take,
     /// Rows are picked straight from the input batches, one output batch at a time.
     Interleave,
@@ -667,9 +668,22 @@ enum Source {
     Views(Vec<ArrayRef>),
 }
 
+/// How many data buffers the string view arrays `parts` list in all: the length of the list that
+/// their concatenation, and every array taken from it, carries. `None` for other types.
+fn listed_view_buffers(parts: &[&ArrayRef]) -> Option<usize> {
+    let listed = |buffers: fn(&ArrayRef) -> usize| {
+        parts.iter().map(|&a| buffers(a)).sum::<usize>()
+    };
+    match parts.first()?.data_type() {
+        DataType::Utf8View => Some(listed(|a| a.as_string_view().data_buffers().len())),
+        DataType::BinaryView => Some(listed(|a| a.as_binary_view().data_buffers().len())),
+        _ => None,
+    }
+}
+
 /// Builds the output by position: every column of the input becomes one array, and each output
-/// batch takes its rows from those arrays. String view columns stay batch by batch and their rows
-/// are copied instead (see [`copy_views`]).
+/// batch takes its rows from those arrays. A string view column whose buffer lists would grow too
+/// long stays batch by batch and its rows are copied instead (see [`copy_views`]).
 fn gather_by_take(
     batches: Vec<RecordBatch>,
     schema: &SchemaRef,
@@ -683,15 +697,25 @@ fn gather_by_take(
         total += batch.num_rows() as u64;
     }
 
+    // A taken string view array keeps the list of every data buffer of the array it comes from:
+    // taking costs one list entry per input buffer in every output batch, and no copy of the
+    // strings. Copying them costs a read of every string. The views are taken while the lists of
+    // all the output batches together stay within a quarter of the rows, and copied past that: on
+    // many small input batches, and above all after a merge, where every input batch lists the
+    // buffers of many batches. In DataFusion's sort benchmark taking is cheaper on one partition of
+    // a few large batches (copying took up to 1.9x the time there) and copying is cheaper on 8
+    // partitions of small batches (up to 1.6x faster); in the final merge of TPC-H SF10 the lists
+    // would have taken hundreds of GB.
+    let outputs = elements.len().div_ceil(batch_size.max(1));
+    let rows = elements.len();
     let columns: Vec<Source> = (0..schema.fields().len())
         .into_par_iter()
         .map(|column| {
             let parts: Vec<&ArrayRef> =
                 batches.iter().map(|batch| batch.column(column)).collect();
-            if matches!(
-                schema.field(column).data_type(),
-                DataType::Utf8View | DataType::BinaryView
-            ) {
+            let copy = listed_view_buffers(&parts)
+                .is_some_and(|listed| listed.saturating_mul(outputs) > rows / 4);
+            if copy {
                 Ok(Source::Views(parts.into_iter().cloned().collect()))
             } else if parts.len() == 1 {
                 Ok(Source::Whole(Arc::clone(parts[0])))
@@ -738,11 +762,11 @@ fn gather_by_take(
 /// The rows of `chunk` from a string view column given batch by batch (`arrays`), with the strings
 /// that do not fit in their view copied into one data buffer of the output.
 ///
-/// Taking the views would copy less, but a taken view array keeps the list of every data buffer of
-/// the array it is taken from. A column put together from thousands of batches lists thousands of
-/// buffers (and many more when the batches are merges, as in the final merge), and each output
-/// batch got its own copy of that list: memory grew with the square of the rows. At TPC-H scale
-/// factor 10 the final merge of `ORDER BY l_comment` ran out of memory on a 47 GB machine.
+/// Used when taking would make the buffer lists too long (see [`gather_by_take`]): a column put
+/// together from thousands of batches lists thousands of buffers, many more when the batches are
+/// merges, and each output batch got its own copy of that list, so that memory grew with the
+/// square of the rows. At TPC-H scale factor 10 the final merge of `ORDER BY l_comment` ran out of
+/// memory on a 47 GB machine that way.
 fn copy_views(arrays: &[ArrayRef], chunk: &[Element]) -> ArrayRef {
     match arrays[0].data_type() {
         DataType::Utf8View => Arc::new(copy_views_of::<StringViewType>(arrays, chunk)),

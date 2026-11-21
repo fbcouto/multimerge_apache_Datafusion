@@ -8,7 +8,9 @@ use datafusion::arrow::array::{
     Float32Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
     TimestampNanosecondArray, UInt16Array,
 };
-use datafusion::arrow::compute::{SortOptions, concat_batches};
+use datafusion::arrow::compute::{
+    SortOptions, concat_batches, sort_to_indices, take_record_batch,
+};
 use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
@@ -517,39 +519,67 @@ fn takes_the_path_of_the_input() -> Result<()> {
     Ok(())
 }
 
-/// A string view column is copied into each output batch, which then lists one data buffer at most.
-/// A taken view array keeps the list of every data buffer of the column it comes from (here one per
-/// input batch), and before the copy every output batch carried that whole list: at TPC-H scale
-/// factor 10 the merge of sorted partitions ran out of memory with it.
+/// String view columns. A view array taken from a concatenated column keeps the list of every data
+/// buffer of the input, in every output batch. The operator takes while those lists stay short, and
+/// copies the strings when all of them together would pass a quarter of the rows; each output batch
+/// then lists one buffer at most. The worst case is the merge of sorted partitions whose batches
+/// each list the buffers of a whole partition, as the batches of DataFusion's sorts do: at TPC-H
+/// scale factor 10 it ran out of memory before the copy existed.
 #[test]
-fn output_string_views_hold_only_their_own_strings() -> Result<()> {
-    let (schema, data) = table(50_000, 8, 512);
+fn output_string_views_do_not_carry_every_input_buffer() -> Result<()> {
+    let rows = 50_000;
+    let (schema, data) = table(rows, 8, 32);
     let index = schema.index_of("view").unwrap();
     let buffers =
         |batch: &RecordBatch| batch.column(index).as_string_view().data_buffers().len();
-    assert!(data.iter().flatten().map(&buffers).sum::<usize>() >= 100);
     for keys in [&[("i64", false, false)][..], &[("view", true, false)][..]] {
         let sort = ordering(&schema, keys);
+        // Many small input batches: the lists would be long, and the strings are copied.
         let (whole, stats) = sort_batches(data.clone(), &sort, 1000, 4, false)?;
         assert_eq!(stats.path, SortPath::Engine, "{keys:?}");
-        // The partitions sorted one by one, then merged.
+        assert!(
+            whole.iter().all(|b| buffers(b) <= 1),
+            "{keys:?}: whole sort"
+        );
+
+        // Sorted partitions whose batches each list every buffer of their partition.
+        let (name, descending, nulls_first) = keys[0];
+        let key = schema.index_of(name).unwrap();
+        let options = SortOptions {
+            descending,
+            nulls_first,
+        };
         let sorted = data
             .iter()
-            .map(|part| {
-                sort_batches(vec![part.clone()], &sort, 700, 4, false)
-                    .map(|(batches, _)| batches)
+            .map(|part| -> Result<Vec<RecordBatch>> {
+                let all = concat_batches(&schema, part)?;
+                let order = sort_to_indices(all.column(key), Some(options), None)?;
+                let all = take_record_batch(&all, &order)?;
+                Ok((0..all.num_rows())
+                    .step_by(700)
+                    .map(|at| all.slice(at, 700.min(all.num_rows() - at)))
+                    .collect())
             })
             .collect::<Result<Vec<_>>>()?;
+        assert!(sorted.iter().flatten().all(|b| buffers(b) > 100));
         let (merged, stats) = sort_batches(sorted, &sort, 1000, 4, true)?;
         assert_eq!(stats.path, SortPath::Engine, "{keys:?}, merge");
-        for batch in whole.iter().chain(&merged) {
-            assert!(
-                buffers(batch) <= 1,
-                "{keys:?}: an output batch lists {} buffers",
-                buffers(batch)
-            );
-        }
+        assert!(merged.iter().all(|b| buffers(b) <= 1), "{keys:?}: merge");
     }
+
+    // Few large input batches: the lists stay short, and the views are taken without a copy.
+    let (schema, data) = table(rows, 8, 4096);
+    let index = schema.index_of("view").unwrap();
+    let sort = ordering(&schema, &[("i64", false, false)]);
+    let (output, _) = sort_batches(data, &sort, 8192, 4, false)?;
+    let listed: usize = output
+        .iter()
+        .map(|b| b.column(index).as_string_view().data_buffers().len())
+        .sum();
+    assert!(
+        listed > output.len() && listed <= rows / 4,
+        "{listed} buffers listed"
+    );
     Ok(())
 }
 
