@@ -56,9 +56,9 @@ A sort with `fetch` (`ORDER BY ... LIMIT`) is left to DataFusion.
    rows; a batch that is only its integer key is sorted as plain values.
 3. **The engine** sorts `(key, row)` pairs: run detection and a cache-blocked k-way merge where the
    data has order, radix where it does not.
-4. **Output.** The rows are taken column by column, in the sorted order. String view columns are
-   copied instead: each output batch holds its own strings, rather than a list of every data buffer
-   of the input.
+4. **Output.** The rows are taken column by column, in the sorted order. A taken string view array
+   carries the list of every data buffer of the input; when those lists would grow too long (after
+   a merge, or with many small batches), the strings are copied into each output batch instead.
 
 ## Correctness
 
@@ -69,8 +69,8 @@ orderings — ascending and descending, nulls first and last, one to three keys;
 decimals, dates, timestamps, booleans, strings and dictionaries — for the whole sort and for the
 merge of sorted partitions, and every internal option of the operator. Other tests check that
 the rule replaces only full sorts, that plans with several window functions over conflicting
-orderings still pass DataFusion's plan checks, and that output batches of string views hold only
-their own strings.
+orderings still pass DataFusion's plan checks, and that output batches of string views do not
+carry the list of every data buffer of the input.
 
 DataFusion's own SQL test suite (sqllogictest, the 502 test files of DataFusion 55.3.0) was run
 with the rule installed in the session of every test file (`scripts/sqllogictest.sh` sets it up):
@@ -110,18 +110,18 @@ TPC-H scale factor 1, table loaded into memory first (`--mem-table`):
 
 | Query | Sort keys | DataFusion | `FinalMerge` | `WholeSort` |
 | :--- | :--- | ---: | ---: | ---: |
-| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 173.2 ms | 25.9 ms (6.69x) | 81.2 ms (2.13x) |
-| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 160.0 ms | 30.1 ms (5.32x) | 82.6 ms (1.94x) |
-| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 1010.1 ms | 337.6 ms (2.99x) | 354.1 ms (2.85x) |
-| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 277.3 ms | 49.6 ms (5.59x) | 89.6 ms (3.09x) |
-| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 626.0 ms | 255.6 ms (2.45x) | 765.0 ms (0.82x) |
-| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 630.2 ms | 266.7 ms (2.36x) | 756.5 ms (0.83x) |
-| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 1105.8 ms | 440.9 ms (2.51x) | 938.0 ms (1.18x) |
-| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 488.5 ms | 106.7 ms (4.58x) | 141.6 ms (3.45x) |
-| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 496.1 ms | 103.5 ms (4.79x) | 145.7 ms (3.40x) |
-| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 697.0 ms | 177.5 ms (3.93x) | 235.7 ms (2.96x) |
-| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 303.1 ms | 56.1 ms (5.40x) | 184.7 ms (1.64x) |
-| Geometric mean | | | 3.98x | 1.96x |
+| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 171.2 ms | 25.7 ms (6.66x) | 84.6 ms (2.02x) |
+| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 158.4 ms | 30.1 ms (5.26x) | 85.0 ms (1.86x) |
+| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 1029.6 ms | 335.4 ms (3.07x) | 322.7 ms (3.19x) |
+| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 278.0 ms | 49.3 ms (5.64x) | 90.4 ms (3.08x) |
+| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 604.8 ms | 260.9 ms (2.32x) | 621.6 ms (0.97x) |
+| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 619.4 ms | 260.9 ms (2.37x) | 651.8 ms (0.95x) |
+| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 1110.6 ms | 453.6 ms (2.45x) | 812.6 ms (1.37x) |
+| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 487.2 ms | 101.2 ms (4.81x) | 155.0 ms (3.14x) |
+| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 492.1 ms | 105.3 ms (4.67x) | 158.4 ms (3.11x) |
+| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 694.2 ms | 180.2 ms (3.85x) | 260.5 ms (2.66x) |
+| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 294.1 ms | 51.9 ms (5.67x) | 205.4 ms (1.43x) |
+| Geometric mean | | | 3.98x | 1.97x |
 
 6,001,215 rows, 24 partitions, batches of 8192 rows, median of 5 runs, table in memory.
 
@@ -129,18 +129,18 @@ The same, reading the Parquet files:
 
 | Query | Sort keys | DataFusion | `FinalMerge` | `WholeSort` |
 | :--- | :--- | ---: | ---: | ---: |
-| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 178.2 ms | 38.2 ms (4.66x) | 97.1 ms (1.84x) |
-| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 158.9 ms | 32.6 ms (4.87x) | 18.3 ms (8.68x) |
-| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 1026.5 ms | 392.9 ms (2.61x) | 375.2 ms (2.74x) |
-| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 276.7 ms | 47.9 ms (5.78x) | 26.5 ms (10.44x) |
-| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 484.9 ms | 273.9 ms (1.77x) | 753.5 ms (0.64x) |
-| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 499.9 ms | 287.0 ms (1.74x) | 648.7 ms (0.77x) |
-| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 956.3 ms | 491.8 ms (1.94x) | 950.2 ms (1.01x) |
-| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 468.0 ms | 126.5 ms (3.70x) | 171.2 ms (2.73x) |
-| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 484.2 ms | 136.4 ms (3.55x) | 183.7 ms (2.64x) |
-| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 716.8 ms | 227.8 ms (3.15x) | 315.2 ms (2.27x) |
-| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 363.1 ms | 83.7 ms (4.34x) | 282.3 ms (1.29x) |
-| Geometric mean | | | 3.21x | 2.16x |
+| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 179.6 ms | 36.2 ms (4.96x) | 94.0 ms (1.91x) |
+| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 156.0 ms | 33.1 ms (4.71x) | 18.9 ms (8.25x) |
+| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 1016.7 ms | 388.8 ms (2.61x) | 365.8 ms (2.78x) |
+| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 272.6 ms | 49.4 ms (5.52x) | 27.5 ms (9.91x) |
+| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 490.0 ms | 278.3 ms (1.76x) | 735.2 ms (0.67x) |
+| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 505.8 ms | 286.9 ms (1.76x) | 694.4 ms (0.73x) |
+| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 969.9 ms | 494.9 ms (1.96x) | 947.4 ms (1.02x) |
+| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 459.5 ms | 122.8 ms (3.74x) | 190.2 ms (2.42x) |
+| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 473.0 ms | 129.8 ms (3.64x) | 196.6 ms (2.41x) |
+| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 721.1 ms | 247.7 ms (2.91x) | 337.9 ms (2.13x) |
+| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 328.5 ms | 83.8 ms (3.92x) | 291.1 ms (1.13x) |
+| Geometric mean | | | 3.17x | 2.07x |
 
 6,001,215 rows, 24 partitions, batches of 8192 rows, median of 5 runs, reading Parquet.
 
@@ -149,18 +149,18 @@ page cache, median of 3 runs:
 
 | Query | Sort keys | DataFusion | `FinalMerge` | `WholeSort` |
 | :--- | :--- | ---: | ---: | ---: |
-| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 2300.6 ms | 372.1 ms (6.18x) | 962.5 ms (2.39x) |
-| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 1878.4 ms | 366.0 ms (5.13x) | 162.3 ms (11.57x) |
-| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 13097.0 ms | 4174.8 ms (3.14x) | 5852.1 ms (2.24x) |
-| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 3425.4 ms | 600.9 ms (5.70x) | 249.7 ms (13.72x) |
-| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 4921.5 ms | 2898.7 ms (1.70x) | 10719.5 ms (0.46x) |
-| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 5225.9 ms | 3010.4 ms (1.74x) | 10963.4 ms (0.48x) |
-| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 14152.3 ms | see below | 14591.1 ms (0.97x) |
-| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 4704.1 ms | 1455.3 ms (3.23x) | 1714.0 ms (2.74x) |
-| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 4935.8 ms | 1473.4 ms (3.35x) | 1886.5 ms (2.62x) |
-| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 8361.1 ms | 2407.1 ms (3.47x) | 3086.4 ms (2.71x) |
-| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 4620.5 ms | 903.7 ms (5.11x) | 2275.5 ms (2.03x) |
-| Geometric mean | | | 3.55x | 2.24x |
+| Q1 | 1 key (INTEGER, 7 values) + 1 payload column | 2206.8 ms | 408.1 ms (5.41x) | 1042.4 ms (2.12x) |
+| Q2 | 1 key (BIGINT, 1.5M values) + 1 payload column | 1891.4 ms | 393.8 ms (4.80x) | 175.7 ms (10.76x) |
+| Q3 | 1 key (VARCHAR, 4.5M values) + 1 payload column | 13137.8 ms | 4168.6 ms (3.15x) | 5842.5 ms (2.25x) |
+| Q4 | 2 keys (BIGINT 1.5M, INTEGER 7) + 1 payload column | 3430.6 ms | 629.6 ms (5.45x) | 265.9 ms (12.90x) |
+| Q5 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M), no payload | 4911.4 ms | 2904.6 ms (1.69x) | 11021.9 ms (0.45x) |
+| Q6 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 1 payload column | 5260.1 ms | 3107.9 ms (1.69x) | 11116.0 ms (0.47x) |
+| Q7 | 3 keys (INTEGER 7, BIGINT 10k, BIGINT 1.5M) + 12 payload columns | 14207.0 ms | see below | 14295.8 ms (0.99x) |
+| Q8 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M), no payload | 4755.7 ms | 1410.7 ms (3.37x) | 1802.0 ms (2.64x) |
+| Q9 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 1 payload column | 4939.4 ms | 1462.3 ms (3.38x) | 1877.6 ms (2.63x) |
+| Q10 | 4 keys (BIGINT 1.5M, BIGINT 10k, INTEGER 7, VARCHAR 4.5M) + 12 payload columns | 8376.9 ms | 2377.7 ms (3.52x) | 3068.2 ms (2.73x) |
+| Q11 | 1 key (VARCHAR, 7 values) + 2 payload columns | 4621.6 ms | 914.2 ms (5.06x) | 2984.0 ms (1.55x) |
+| Geometric mean | | | 3.48x | 2.13x |
 
 59,986,052 rows, 24 partitions, batches of 8192 rows. The numbers of values in the key
 descriptions are those of SF1. The geometric mean of `FinalMerge` leaves Q7 out.
@@ -169,30 +169,30 @@ Peak resident memory of each of those processes, in GB:
 
 | Query | DataFusion | `FinalMerge` | `WholeSort` |
 | :--- | ---: | ---: | ---: |
-| Q1 | 1.0 | 1.4 | 3.0 |
-| Q2 | 1.4 | 1.9 | 1.6 |
-| Q3 | 6.0 | 11.6 | 8.0 |
-| Q4 | 2.6 | 4.7 | 2.6 |
-| Q5 | 3.1 | 7.6 | 4.6 |
-| Q6 | 3.6 | 8.6 | 5.8 |
-| Q7 | 11.7 | 36.4 in one run; stopped at 41.3 in three | 27.1 |
-| Q8 | 8.2 | 13.6 | 10.0 |
-| Q9 | 8.8 | 14.4 | 11.3 |
-| Q10 | 16.6 | 28.6 | 32.2 |
-| Q11 | 4.5 | 7.2 | 9.4 |
+| Q1 | 1.0 | 1.5 | 3.0 |
+| Q2 | 1.3 | 1.8 | 1.6 |
+| Q3 | 5.8 | 11.4 | 7.9 |
+| Q4 | 2.5 | 4.7 | 2.6 |
+| Q5 | 3.1 | 7.5 | 4.5 |
+| Q6 | 3.6 | 8.4 | 5.8 |
+| Q7 | 11.7 | 38.8 in one run; stopped at 41.4 in three | 27.1 |
+| Q8 | 8.1 | 13.6 | 10.1 |
+| Q9 | 8.6 | 14.4 | 11.2 |
+| Q10 | 16.6 | 28.7 | 32.4 |
+| Q11 | 4.4 | 7.2 | 9.3 |
 
 The operator needs more memory than DataFusion's plan, up to about three times as much: it keeps
-its whole input until the output is built, keeps a concatenated copy of every column that is not a
-string view while it builds the output, and builds the output in full before returning the first
-batch (DataFusion streams it). Q7 with `FinalMerge` (12 payload columns, after DataFusion's own
-per-partition sorts) is at the limit of this 47 GB machine: a run on its own took 5.8 s and peaked
-at 36.4 GB; with three runs in one process the first took 6.7 s, the second 24.2 s, and the third
-was stopped when less than 3 GB of memory were left.
+its whole input until the output is built, keeps a concatenated copy of the columns while it builds
+the output (string views whose rows are copied excepted), and builds the output in full before
+returning the first batch (DataFusion streams it). Q7 with `FinalMerge` (12 payload columns, after DataFusion's own
+per-partition sorts) is at the limit of this 47 GB machine: a run on its own took 6.2 s and peaked
+at 38.8 GB; with three runs in one process the first took 6.3 s and the second was stopped when
+less than 3 GB of memory were left.
 
 - In `FinalMerge` mode DataFusion still sorts each of the 24 partitions; the operator replaces
   only `SortPreservingMergeExec`, which merges the sorted partitions on one thread. In these
   queries that merge takes most of DataFusion's time.
-- `WholeSort` loses on Q5 and Q6, more at SF10 (0.46x and 0.48x), and only ties on Q7: three key
+- `WholeSort` loses on Q5 and Q6, more at SF10 (0.45x and 0.47x), and only ties on Q7: three key
   columns, the first with only 7 values. After the bytes that all rows share, the 8-byte prefix of
   these keys is mostly constant bytes, so most comparisons go to the full rows.
 - `WholeSort` times vary by up to 30% between runs of the same binary on this machine (Q11 at SF1:
@@ -244,8 +244,7 @@ columns). With 8 threads it is faster in all 72.
 - **No limit.** Sorts with `fetch` stay with DataFusion's operators.
 - **One output partition**, produced after all the input has been read.
 - **Memory use.** Besides its input, the operator holds the sort keys and, while it builds the
-  output, a concatenated copy of the columns that are not string views; the output is built in
-  full before it is returned. At TPC-H SF10 its peak was up to about three times that of
+  output, a concatenated copy of the columns; the output is built in full before it is returned. At TPC-H SF10 its peak was up to about three times that of
   DataFusion's plan, and on one query (Q7, `FinalMerge`) close to the 47 GB of the machine used for
   the benchmarks (see Benchmarks).
 
