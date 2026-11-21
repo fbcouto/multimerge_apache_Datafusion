@@ -11,6 +11,12 @@ already sorted, a key that follows another — and that is where it pays most.
 
 Status: experimental. Tested with DataFusion 55.3.0.
 
+A [5-minute video](https://youtu.be/6IBn_Cl8D_Q) presents the operator, the measurements and the
+limits. It is narrated with a synthetic voice (Kokoro, an open-source model) reading the author's
+script.
+
+<a href="https://youtu.be/6IBn_Cl8D_Q"><img src="https://img.youtube.com/vi/6IBn_Cl8D_Q/maxresdefault.jpg" width="560" alt="Watch on YouTube: A parallel final merge for Apache DataFusion sorts (5 minutes)"></a>
+
 ## Usage
 
 ```rust
