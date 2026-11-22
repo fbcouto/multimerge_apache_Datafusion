@@ -69,6 +69,8 @@ fn table(
         let mut single_floats = Vec::with_capacity(size);
         let mut shorts = Vec::with_capacity(size);
         let mut days = Vec::with_capacity(size);
+        let mut bigs = Vec::with_capacity(size);
+        let mut wides = Vec::with_capacity(size);
         for &id in &ids {
             let r = random.next();
             i64s.push(r as i64);
@@ -93,6 +95,20 @@ fn table(
                 None
             } else {
                 Some((r % 1000) as i32 - 500)
+            });
+            // 8-byte values with nulls. "big" has the largest i64 but not the smallest: the keys of its
+            // values move to make room for NULL. "wide" has both, its values take every key, and NULL
+            // needs a 65th bit.
+            bigs.push(match id % 29 {
+                0 => None,
+                1 => Some(i64::MAX),
+                _ => Some((r % 1_000_000) as i64),
+            });
+            wides.push(match id % 31 {
+                0 => None,
+                1 => Some(i64::MIN),
+                2 => Some(i64::MAX),
+                _ => Some(r as i64),
             });
             floats.push(match id % 101 {
                 0 => None,
@@ -156,6 +172,8 @@ fn table(
             ("f32nn", Arc::new(Float32Array::from(single_floats))),
             ("u16", Arc::new(UInt16Array::from(shorts))),
             ("day", Arc::new(Date32Array::from(days))),
+            ("big", Arc::new(Int64Array::from(bigs))),
+            ("wide", Arc::new(Int64Array::from(wides))),
         ];
         let record = RecordBatch::try_from_iter(columns).unwrap();
         schema.get_or_insert_with(|| record.schema());
@@ -207,6 +225,10 @@ const ORDERINGS: &[&[Key]] = &[
     &[("u16", true, false)],
     &[("day", false, false)],
     &[("day", true, true)],
+    &[("big", false, false)],
+    &[("big", true, true)],
+    &[("wide", false, true)],
+    &[("wide", true, false)],
     &[("small", false, false), ("i64", true, false)],
     &[("dict", false, false), ("s", false, true)],
     &[
@@ -395,10 +417,19 @@ async fn bare_keys_and_every_tuning_agree_with_datafusion() -> Result<()> {
                 ..default
             },
         ),
+        (
+            "no nullable keys",
+            Tuning {
+                nullable_keys: false,
+                ..default
+            },
+        ),
     ];
 
     // One column alone.
-    for name in ["i64", "f64nn", "f32nn", "u16", "day", "ts", "small", "s"] {
+    for name in [
+        "i64", "f64nn", "f32nn", "u16", "day", "ts", "small", "f64", "big", "wide", "s",
+    ] {
         let index = schema.index_of(name).unwrap();
         let alone: Vec<Vec<RecordBatch>> = data
             .iter()
@@ -432,9 +463,16 @@ async fn bare_keys_and_every_tuning_agree_with_datafusion() -> Result<()> {
                     keys,
                     &format!("{name} alone, descending={descending}, {label}"),
                 );
+                // "small", "f64" and "big" have nulls: they take the bare-key path only with nullable
+                // keys. "wide" never does: its values take every 8-byte key, and with the bit for NULL
+                // the key has 65 bits.
                 let bare = tuning.bare_keys
                     && tuning.exact_keys
-                    && !matches!(name, "small" | "s");
+                    && match name {
+                        "s" | "wide" => false,
+                        "small" | "f64" | "big" => tuning.nullable_keys,
+                        _ => true,
+                    };
                 assert_eq!(
                     stats.path == SortPath::BareKeys,
                     bare,

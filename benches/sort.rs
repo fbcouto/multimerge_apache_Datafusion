@@ -21,7 +21,8 @@
 //! MultiMerge operator over the same data, and a mode that prints where the time of the operator
 //! goes (`MULTIMERGE_PHASES=1`). Every line of DataFusion's file is here, unchanged and in the same
 //! order, so that the comparison runs on exactly the data and the plans of DataFusion's own
-//! benchmark.
+//! benchmark. One data case is NOT DataFusion's: "i64 with nulls" (`i64_with_nulls_streams`), its
+//! i64 values with one in ten set to NULL, because none of DataFusion's cases has nulls in a key.
 //!
 //! Each benchmark:
 //! 1. Creates a list of tuples (sorted if necessary)
@@ -258,6 +259,12 @@ fn multimerge_phases() {
             vec![8],
         ),
         (
+            "i64 with nulls 1M, 8 streams",
+            i64_with_nulls_streams(false, ROWS),
+            BATCH_SIZE,
+            vec![8],
+        ),
+        (
             "utf8 dictionary tuple 1M, 8 streams",
             dictionary_tuple_streams(false, ROWS),
             BATCH_SIZE,
@@ -284,6 +291,13 @@ fn multimerge_phases() {
             "stable engine",
             Tuning {
                 stable_engine: true,
+                ..default
+            },
+        ),
+        (
+            "no nullable keys",
+            Tuning {
+                nullable_keys: false,
                 ..default
             },
         ),
@@ -323,6 +337,24 @@ fn multimerge_phases() {
             }
         }
     }
+}
+
+/// Not in DataFusion's benchmark: the i64 values of [`i64_streams`] with one in ten set to NULL, by a
+/// seeded and so fixed choice. Sorted, the NULLs come first, as the sort's default options ask.
+fn i64_with_nulls_streams(sorted: bool, input_size: u64) -> PartitionedBatches {
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut values: Vec<Option<i64>> = DataGenerator::new(input_size)
+        .i64_values()
+        .into_iter()
+        .map(|v| (rng.random_range(0..10) != 0).then_some(v))
+        .collect();
+    if sorted {
+        values.sort_unstable();
+    }
+    split_tuples(values, |v| {
+        let array = Int64Array::from(v);
+        RecordBatch::try_from_iter(vec![("i64", Arc::new(array) as _)]).unwrap()
+    })
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -391,6 +423,11 @@ fn criterion_benchmark(c: &mut Criterion) {
                 Box::new(move |sorted| {
                     mixed_tuple_with_utf8_view_streams(sorted, input_size)
                 }),
+            ),
+            // Not DataFusion's data: see `i64_with_nulls_streams`.
+            (
+                "i64 with nulls",
+                Box::new(move |sorted| i64_with_nulls_streams(sorted, input_size)),
             ),
         ];
 

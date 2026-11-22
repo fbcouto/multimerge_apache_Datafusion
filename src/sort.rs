@@ -2,8 +2,10 @@
 //!
 //! The sort keys of every row become something that orders by plain comparison:
 //!
-//! - one primitive column without nulls is read as it is, as an integer in the sort order
-//!   ([`Keys::Exact`]);
+//! - one primitive column is read as it is, as an integer in the sort order ([`Keys::Exact`]); when
+//!   it has nulls, the keys of the values move to make room and NULL takes the key next to them,
+//!   first or last ([`NullKey`]); only 8-byte values that take every key need one more bit for
+//!   NULL, a 65-bit key ([`Keys::Wide`]);
 //! - anything else is encoded with Arrow's row format, which turns any combination of columns,
 //!   directions and null placements into one byte string per row whose byte order is the sort order
 //!   ([`Keys::Bytes`]).
@@ -29,7 +31,7 @@ use datafusion::arrow::array::{
     Array, ArrayData, ArrayRef, AsArray, GenericByteViewArray, RecordBatchOptions,
     UInt32Array, UInt64Array, make_array,
 };
-use datafusion::arrow::buffer::Buffer;
+use datafusion::arrow::buffer::{Buffer, NullBuffer};
 use datafusion::arrow::compute::{
     concat, interleave_record_batch, take, take_record_batch,
 };
@@ -116,8 +118,11 @@ pub enum Gather {
 /// Choices that do not change the result, only how it is produced. They exist for measurements.
 #[derive(Clone, Copy, Debug)]
 pub struct Tuning {
-    /// Read the key of a single primitive column without nulls as an integer, instead of encoding bytes.
+    /// Read the key of a single primitive column as an integer, instead of encoding bytes.
     pub exact_keys: bool,
+    /// With `exact_keys`, read that column as an integer also when it has nulls, NULL taking a key of
+    /// its own (see [`NullKey`]). Without it such a column is encoded as bytes.
+    pub nullable_keys: bool,
     /// Sort a batch that is only its integer key by the key values themselves.
     pub bare_keys: bool,
     /// Use the stable entries of the engine.
@@ -129,6 +134,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             exact_keys: true,
+            nullable_keys: true,
             bare_keys: true,
             stable_engine: false,
             gather: Gather::Take,
@@ -208,6 +214,21 @@ enum Kind {
     Float,
 }
 
+/// Where the NULLs of a sort column with nulls go in its integer keys. It is decided from the keys
+/// of the values ([`ExactKey::keys`]), and all NULLs get the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullKey {
+    /// The keys of the values move down by `offset` (wrapping) to begin at 0, and NULL takes `code`,
+    /// the key right after the largest; with NULLS FIRST they begin at 1 and NULL takes 0. All the
+    /// keys stay in one range, as the engine's radix pass needs: with a bit above the value bits
+    /// instead, NULL alone on one side of it, the values fall into a few buckets of that pass and
+    /// the engine sorts them by comparison.
+    Code { offset: u64, code: u64 },
+    /// 8-byte values that take every key leave none for NULL: one more bit, above the value bits, is
+    /// set on the side that sorts last, and a NULL's value bits are zero ([`Keys::Wide`]).
+    Bit { nulls_first: bool },
+}
+
 /// One primitive sort column whose values, read as integers, are the whole key.
 #[derive(Clone, Copy)]
 struct ExactKey {
@@ -215,6 +236,8 @@ struct ExactKey {
     /// Bytes of one value.
     width: usize,
     descending: bool,
+    /// Where the NULLs go, when the column has nulls.
+    nulls: Option<NullKey>,
 }
 
 impl ExactKey {
@@ -239,6 +262,7 @@ impl ExactKey {
             kind,
             width,
             descending,
+            nulls: None,
         })
     }
 
@@ -280,8 +304,83 @@ impl ExactKey {
         }
     }
 
-    /// The keys of all the values of a primitive array without nulls.
-    fn keys_of(&self, array: &dyn Array) -> Vec<u64> {
+    /// The keys of the rows of every batch, given the sort column of each one. When the column has
+    /// nulls, this decides where they go ([`NullKey`]), and the key it returns says so.
+    fn keys(mut self, arrays: &[&dyn Array], nulls_first: bool) -> (Self, Keys) {
+        let mut keys: Vec<Vec<u64>> = arrays
+            .par_iter()
+            .map(|array| self.value_keys(*array))
+            .collect();
+        if arrays.iter().all(|array| array.null_count() == 0) {
+            return (self, Keys::Exact(keys));
+        }
+
+        // The smallest and the largest key of the values, without the bits above the width.
+        let mask = self.mask();
+        let (low, high) = keys
+            .par_iter()
+            .zip(arrays.par_iter())
+            .map(|(keys, array)| {
+                let nulls = array.nulls();
+                let mut range = (u64::MAX, 0u64);
+                for (row, &key) in keys.iter().enumerate() {
+                    if nulls.is_none_or(|n| n.is_valid(row)) {
+                        range = (range.0.min(key & mask), range.1.max(key & mask));
+                    }
+                }
+                range
+            })
+            .reduce(|| (u64::MAX, 0), |a, b| (a.0.min(b.0), a.1.max(b.1)));
+
+        if self.width == 8 && low == 0 && high == u64::MAX {
+            self.nulls = Some(NullKey::Bit { nulls_first });
+            let wide = keys
+                .into_par_iter()
+                .zip(arrays.par_iter())
+                .map(|(keys, array)| {
+                    let nulls = array.nulls();
+                    keys.into_iter()
+                        .enumerate()
+                        .map(|(row, key)| {
+                            if nulls.is_some_and(|n| n.is_null(row)) {
+                                u128::from(!nulls_first) << 64
+                            } else {
+                                (u128::from(nulls_first) << 64) | u128::from(key)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            return (self, Keys::Wide(wide));
+        }
+
+        // With only NULLs, `low` is above `high` and any key serves. Values of up to 4 bytes always
+        // leave room in the `u64` for the key after the largest.
+        let (offset, code) = if low > high {
+            (0, 0)
+        } else if nulls_first {
+            (low.wrapping_sub(1), 0)
+        } else {
+            (low, high - low + 1)
+        };
+        self.nulls = Some(NullKey::Code { offset, code });
+        keys.par_iter_mut()
+            .zip(arrays.par_iter())
+            .for_each(|(keys, array)| {
+                let nulls = array.nulls();
+                for (row, key) in keys.iter_mut().enumerate() {
+                    *key = if nulls.is_some_and(|n| n.is_null(row)) {
+                        code
+                    } else {
+                        (*key & mask).wrapping_sub(offset)
+                    };
+                }
+            });
+        (self, Keys::Exact(keys))
+    }
+
+    /// The keys of all the values of a primitive array, ignoring its nulls.
+    fn value_keys(&self, array: &dyn Array) -> Vec<u64> {
         let data = array.to_data();
         let (start, end) = (
             data.offset() * self.width,
@@ -311,31 +410,38 @@ impl ExactKey {
         }
     }
 
-    /// An array of `data_type` with the values of `keys`, in that order.
+    /// An array of `data_type` with the values of `keys` ([`Keys::Exact`]), in that order. With nulls,
+    /// the rows whose key is the NULL code are NULL.
     fn array_of(&self, keys: &[u64], data_type: &DataType) -> Result<ArrayRef> {
-        let buffer = match self.width {
-            1 => Buffer::from_vec(
-                keys.iter()
-                    .map(|&k| self.bits(k) as u8)
-                    .collect::<Vec<u8>>(),
+        let (offset, nulls) = match self.nulls {
+            None => (0, None),
+            Some(NullKey::Code { offset, code }) => (
+                offset,
+                Some(NullBuffer::from(
+                    keys.iter().map(|&k| k != code).collect::<Vec<bool>>(),
+                )),
             ),
+            Some(NullKey::Bit { .. }) => {
+                return exec_err!("MultiMerge sort: 65-bit keys are not bare values");
+            }
+        };
+        let bits = |k: u64| self.bits(k.wrapping_add(offset));
+        let buffer = match self.width {
+            1 => {
+                Buffer::from_vec(keys.iter().map(|&k| bits(k) as u8).collect::<Vec<u8>>())
+            }
             2 => Buffer::from_vec(
-                keys.iter()
-                    .map(|&k| self.bits(k) as u16)
-                    .collect::<Vec<u16>>(),
+                keys.iter().map(|&k| bits(k) as u16).collect::<Vec<u16>>(),
             ),
             4 => Buffer::from_vec(
-                keys.iter()
-                    .map(|&k| self.bits(k) as u32)
-                    .collect::<Vec<u32>>(),
+                keys.iter().map(|&k| bits(k) as u32).collect::<Vec<u32>>(),
             ),
-            _ => {
-                Buffer::from_vec(keys.iter().map(|&k| self.bits(k)).collect::<Vec<u64>>())
-            }
+            _ => Buffer::from_vec(keys.iter().map(|&k| bits(k)).collect::<Vec<u64>>()),
         };
         let data = ArrayData::builder(data_type.clone())
             .len(keys.len())
             .add_buffer(buffer)
+            .nulls(nulls)
             .build()?;
         Ok(make_array(data))
     }
@@ -343,10 +449,31 @@ impl ExactKey {
 
 /// The sort keys of every row, batch by batch, in a form that orders by plain comparison.
 enum Keys {
-    /// The whole key as an integer: one primitive column without nulls.
+    /// The whole key as an integer: one primitive column, with [`NullKey::Code`] when it has nulls.
     Exact(Vec<Vec<u64>>),
+    /// The whole key as a 65-bit integer: one primitive column of 8-byte values that take every key,
+    /// with nulls ([`NullKey::Bit`]).
+    Wide(Vec<Vec<u128>>),
     /// Bytes from Arrow's row format: any types, any number of columns.
     Bytes(Vec<Rows>),
+}
+
+/// `Some(backwards)` when the integer keys of a batch are in order, read forwards or backwards.
+fn integer_direction<T: Ord>(keys: &[T], stop: &AtomicBool) -> Option<bool> {
+    let (mut ascending, mut descending) = (true, true);
+    let mut start = 1;
+    while start < keys.len() {
+        let end = (start + 1024).min(keys.len());
+        for row in start..end {
+            ascending &= keys[row - 1] <= keys[row];
+            descending &= keys[row - 1] >= keys[row];
+        }
+        if (!ascending && !descending) || stop.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        start = end;
+    }
+    Some(!ascending)
 }
 
 impl Keys {
@@ -355,6 +482,7 @@ impl Keys {
     fn compare(&self, a: (usize, usize), b: (usize, usize)) -> Ordering {
         match self {
             Keys::Exact(keys) => keys[a.0][a.1].cmp(&keys[b.0][b.1]),
+            Keys::Wide(keys) => keys[a.0][a.1].cmp(&keys[b.0][b.1]),
             Keys::Bytes(rows) => rows[a.0].row(a.1).cmp(&rows[b.0].row(b.1)),
         }
     }
@@ -364,21 +492,8 @@ impl Keys {
     fn direction(&self, batch: usize, stop: &AtomicBool) -> Option<bool> {
         let (mut ascending, mut descending) = (true, true);
         match self {
-            Keys::Exact(keys) => {
-                let keys = &keys[batch];
-                let mut start = 1;
-                while start < keys.len() {
-                    let end = (start + 1024).min(keys.len());
-                    for row in start..end {
-                        ascending &= keys[row - 1] <= keys[row];
-                        descending &= keys[row - 1] >= keys[row];
-                    }
-                    if (!ascending && !descending) || stop.load(AtomicOrdering::Relaxed) {
-                        return None;
-                    }
-                    start = end;
-                }
-            }
+            Keys::Exact(keys) => return integer_direction(&keys[batch], stop),
+            Keys::Wide(keys) => return integer_direction(&keys[batch], stop),
             Keys::Bytes(rows) => {
                 let rows = &rows[batch];
                 for row in 1..rows.num_rows() {
@@ -446,22 +561,25 @@ fn sort_in_pool(
         .collect::<Result<Vec<_>>>()?;
 
     let first = ordering.iter().next().expect("a sort has at least one key");
-    let exact = (tuning.exact_keys && ordering.len() == 1)
+    let has_nulls = ordering.len() == 1
+        && key_columns
+            .iter()
+            .any(|columns| columns[0].null_count() > 0);
+    let exact = (tuning.exact_keys
+        && ordering.len() == 1
+        && (!has_nulls || tuning.nullable_keys))
         .then(|| ExactKey::of(key_columns[0][0].data_type(), first.options.descending))
-        .flatten()
-        .filter(|_| {
-            key_columns
-                .iter()
-                .all(|columns| columns[0].null_count() == 0)
-        });
+        .flatten();
 
-    let keys = match exact {
-        Some(exact) => Keys::Exact(
-            key_columns
-                .par_iter()
-                .map(|columns| exact.keys_of(columns[0].as_ref()))
-                .collect(),
-        ),
+    let (exact, keys) = match exact {
+        Some(exact) => {
+            let arrays: Vec<&dyn Array> = key_columns
+                .iter()
+                .map(|columns| columns[0].as_ref())
+                .collect();
+            let (exact, keys) = exact.keys(&arrays, first.options.nulls_first);
+            (Some(exact), keys)
+        }
         None => {
             let fields = ordering
                 .iter()
@@ -475,7 +593,7 @@ fn sort_in_pool(
                 .par_iter()
                 .map(|columns| converter.convert_columns(columns))
                 .collect::<std::result::Result<Vec<Rows>, ArrowError>>()?;
-            Keys::Bytes(rows)
+            (None, Keys::Bytes(rows))
         }
     };
     let encode = started.elapsed();
@@ -557,6 +675,24 @@ fn sort_in_pool(
                 });
             None
         }
+        Keys::Wide(per_batch) => {
+            // The prefix is the null bit and the 63 high bits of the value; rows tied on it are
+            // compared by their whole 65-bit keys.
+            slices
+                .into_par_iter()
+                .zip(per_batch.par_iter())
+                .enumerate()
+                .for_each(|(batch, (slice, keys))| {
+                    let base = (batch as u64) << ROW_BITS;
+                    for (row, (element, &key)) in slice.iter_mut().zip(keys).enumerate() {
+                        *element = Element {
+                            key: (key >> 1) as u64,
+                            id: base | row as u64,
+                        };
+                    }
+                });
+            None
+        }
         Keys::Bytes(rows) => {
             // The bytes that all keys share at the beginning do not help to order them: the prefix takes
             // the eight bytes that come right after. When no key is longer than that, the prefix is the
@@ -607,6 +743,24 @@ fn sort_in_pool(
             };
             let compare = |a: &Element, b: &Element| {
                 a.key.cmp(&b.key).then_with(|| rest(a.id).cmp(rest(b.id)))
+            };
+            if tuning.stable_engine {
+                engine::multi_merge_sort_stable_by_prefix_key(
+                    &mut elements,
+                    |e| e.key,
+                    compare,
+                )
+            } else {
+                engine::multi_merge_sort_by_prefix_key(&mut elements, |e| e.key, compare)
+            }
+        }
+        (_, Keys::Wide(per_batch)) => {
+            let whole =
+                |id: u64| per_batch[(id >> ROW_BITS) as usize][(id & ROW_MASK) as usize];
+            let compare = |a: &Element, b: &Element| {
+                a.key
+                    .cmp(&b.key)
+                    .then_with(|| whole(a.id).cmp(&whole(b.id)))
             };
             if tuning.stable_engine {
                 engine::multi_merge_sort_stable_by_prefix_key(

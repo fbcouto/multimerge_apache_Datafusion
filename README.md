@@ -54,9 +54,11 @@ A sort with `fetch` (`ORDER BY ... LIMIT`) is left to DataFusion.
 
 ## How it sorts
 
-1. **Keys.** A single primitive key column without nulls is read as an integer that preserves the
-   order (including the IEEE total order of floats). Anything else goes through Arrow's row format,
-   and the engine gets an 8-byte prefix of each row plus a comparator for ties.
+1. **Keys.** A single primitive key column is read as an integer that preserves the order
+   (including the IEEE total order of floats). With nulls, the keys of the values move to make
+   room and NULL takes the key next to them, first or last as asked; only 8-byte values that take
+   every key need a 65th bit for NULL. Anything else goes through Arrow's row format, and the
+   engine gets an 8-byte prefix of each row plus a comparator for ties.
 2. **Shortcuts before the engine.** Input that is already one run is returned as it is; batches
    that are each sorted and do not overlap much are merged as ranges, by slicing, without moving
    rows; a batch that is only its integer key is sorted as plain values.
@@ -70,10 +72,11 @@ A sort with `fetch` (`ORDER BY ... LIMIT`) is left to DataFusion.
 
 `tests/sort_correctness.rs` compares every result with DataFusion's own sort (`SortExec` and
 `SortPreservingMergeExec`): the sort keys must be identical row by row, and the set of rows the
-same. It covers 4 data shapes (number of rows, partitions, input and output batch sizes) and 30
+same. It covers 4 data shapes (number of rows, partitions, input and output batch sizes) and 34
 orderings — ascending and descending, nulls first and last, one to three keys; integers, floats,
-decimals, dates, timestamps, booleans, strings and dictionaries — for the whole sort and for the
-merge of sorted partitions, and every internal option of the operator. Other tests check that
+decimals, dates, timestamps, booleans, strings and dictionaries; 8-byte keys with nulls whose
+values reach one end of the range or both — for the whole sort and for the merge of sorted
+partitions, and every internal option of the operator. Other tests check that
 the rule replaces only full sorts, that plans with several window functions over conflicting
 orderings still pass DataFusion's plan checks, and that output batches of string views do not
 carry the list of every data buffer of the input.
@@ -93,7 +96,8 @@ The `EXPLAIN` differences show the operator in place of `SortPreservingMergeExec
 leaves open (the test files record the order DataFusion happens to produce); 2 queries in
 `pwmj.slt` return the order their `ORDER BY` asks for where DataFusion 55.3.0 does not (fixed in
 DataFusion since); and `set_variable.slt` expects the out-of-memory message of `SortExec`, while
-the operator fails with its own, as it does not spill.
+the operator fails with its own, as it does not spill. Run again on 22 Nov 2026, after nullable
+keys became integers, the suite gave the same differences at the same places.
 
 ## Benchmarks
 
@@ -241,6 +245,20 @@ low and high cardinality; 0 to 100 extra columns), which DataFusion sorts on one
 With 1 thread the operator is slower than DataFusion (below 0.95x) in 11 of the 72 cases, 9 of
 them nearly sorted; the lowest is 0.63x (mixed tuple, low cardinality, nearly sorted, 5 extra
 columns). With 8 threads it is faster in all 72.
+
+One case added to the benchmark is not DataFusion's data, because none of DataFusion's cases has
+nulls in a key: "i64 with nulls", the benchmark's i64 values with one in ten set to NULL by a
+seeded choice (measured on 22 Nov 2026, 8 partitions):
+
+| Rows | Sort and merge | Merge of sorted partitions |
+| :--- | ---: | ---: |
+| 100k | 4.13 ms against 1.38 ms: 2.99x | 3.64 ms against 1.25 ms: 2.91x |
+| 1M | 41.82 ms against 6.71 ms: 6.23x | 35.82 ms against 6.87 ms: 5.22x |
+
+The column's keys are integers (see [How it sorts](#how-it-sorts)). With `Tuning::nullable_keys`
+off, it goes through Arrow's row format instead: in the `MULTIMERGE_PHASES` mode the operator's
+sort of 1M rows from 8 streams takes 26.6 ms that way, against 5.5 ms with integer keys. The same
+values without nulls take 5.2 ms.
 
 ## Limitations
 
